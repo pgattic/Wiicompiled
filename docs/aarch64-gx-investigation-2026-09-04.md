@@ -13,8 +13,16 @@ Observed behavior:
 - The corruption pattern remained stable across several shader-side experiments, which argues against this being a simple texture or lighting issue.
 
 Artifacts:
-- `2026-09-04 09-44-30.png`: earlier, more severe corruption.
-- `2026-09-04 12-10-12.png`: improved track/UI state, but racers still broken.
+- `docs/2026-09-04 09-44-30.png`: earlier, more severe corruption.
+- `docs/2026-09-04 12-10-12.png`: improved track/UI state, but racers still broken.
+
+Earlier, more severe corruption:
+
+![Earlier aarch64 corruption](./2026-09-04%2009-44-30.png)
+
+Later state after partial mitigation:
+
+![Later aarch64 corruption after partial mitigation](./2026-09-04%2012-10-12.png)
 
 What appears to help:
 - `aurora-main/lib/gx/command_processor.cpp`
