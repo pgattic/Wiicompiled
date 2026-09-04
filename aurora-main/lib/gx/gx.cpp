@@ -1744,7 +1744,8 @@ static u8 index_attr_size(GXAttr attr, GXCompCnt cnt, GXAttrType type) noexcept 
   return indexSize;
 }
 
-void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
+void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt,
+                              bool directIndexedFallback) noexcept {
   ZoneScoped;
 
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
@@ -1765,8 +1766,10 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
     }
     const auto& attrFmt = vtxFmt.attrs[i];
     const auto cnt = comp_cnt_count(attr, attrFmt.cnt);
+    const auto resolvedType =
+        directIndexedFallback && (type == GX_INDEX8 || type == GX_INDEX16) ? GX_DIRECT : type;
     mapping = AttrConfig{
-        .attrType = static_cast<u8>(type),
+        .attrType = static_cast<u8>(resolvedType),
         .cnt = cnt,
         .compType = static_cast<u8>(attrFmt.type),
         .offset = vtxOffset,
@@ -1775,7 +1778,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
         .le = false,
         .nrmIndexCount = static_cast<u8>(attr == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3 ? 3 : 1),
     };
-    switch (type) {
+    switch (resolvedType) {
     case GX_DIRECT: {
       vtxOffset += comp_type_size(attr, attrFmt.type) * cnt;
       break;

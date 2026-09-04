@@ -550,6 +550,7 @@ void process(const u8* data, u32 size, bool bigEndian) {
       // GXInvalidateVtxCache tells the GPU that CPU-written indexed vertex arrays must be observed by subsequent draws.
       for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
         g_gxState.arrays[i].cachedRange = {};
+        g_gxState.arrays[i].sourceGeneration = kGuestWriteUntracked;
       }
       break;
     }
@@ -1855,19 +1856,120 @@ static u32 calculate_last_vtx_size(GXVtxFmt fmt) {
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                  gfx::Range vertRange, uint16_t usedPnMtxMask,
                                  HashType matrixTopologySignature,
-                                 HashType geometrySignature, bool interpolationIdentityActive);
+                                 HashType geometrySignature, bool interpolationIdentityActive,
+                                 bool indexedAttrsExpanded = false);
+
+#if defined(__aarch64__) && defined(__linux__)
+static uint32_t direct_attr_size(GXAttr attr, const VtxAttrFmt& fmt) noexcept {
+  return static_cast<uint32_t>(comp_type_size(attr, fmt.type)) *
+         static_cast<uint32_t>(comp_cnt_count(attr, fmt.cnt));
+}
+
+static void log_indexed_fallback_use(const char* path, GXVtxFmt fmt, uint16_t vtxCount,
+                                     uint32_t bytes) noexcept {
+  static uint32_t logCount = 0;
+  if (logCount < 16) {
+    Log.warn("aarch64 indexed-vertex CPU fallback path={} fmt={} vtxCount={} bytes={}",
+             path, static_cast<uint32_t>(fmt), vtxCount, bytes);
+    ++logCount;
+    if (logCount == 16) {
+      Log.warn("suppressing further aarch64 indexed-vertex CPU fallback logs");
+    }
+  }
+}
+
+static bool draw_uses_indexed_attrs(GXVtxFmt fmt) noexcept {
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto type = g_gxState.vtxDesc[i];
+    if (type == GX_INDEX8 || type == GX_INDEX16) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool expand_indexed_vertices(GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
+                                    bool bigEndian, std::vector<uint8_t>& out) {
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  uint32_t inputStride = 0;
+  uint32_t outputStride = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    const auto type = g_gxState.vtxDesc[i];
+    if (type == GX_NONE) {
+      continue;
+    }
+    const auto& attrFmt = vtxFmt.attrs[i];
+    const uint32_t bytes = direct_attr_size(attr, attrFmt);
+    outputStride += bytes;
+    if (type == GX_DIRECT) {
+      inputStride += bytes;
+    } else if (type == GX_INDEX8 || type == GX_INDEX16) {
+      const uint32_t indexWidth = type == GX_INDEX16 ? 2u : 1u;
+      inputStride += indexWidth * ((attr == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3) ? 3u : 1u);
+    } else {
+      return false;
+    }
+  }
+
+  out.resize(static_cast<size_t>(vtxCount) * outputStride);
+  const uint8_t* srcVertex = vertices;
+  uint8_t* dstVertex = out.data();
+  for (uint16_t vertex = 0; vertex < vtxCount; ++vertex) {
+    const uint8_t* src = srcVertex;
+    uint8_t* dst = dstVertex;
+    for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+      const auto attr = static_cast<GXAttr>(i);
+      const auto type = g_gxState.vtxDesc[i];
+      if (type == GX_NONE) {
+        continue;
+      }
+      const auto& attrFmt = vtxFmt.attrs[i];
+      const uint32_t bytes = direct_attr_size(attr, attrFmt);
+      if (type == GX_DIRECT) {
+        std::memcpy(dst, src, bytes);
+        src += bytes;
+        dst += bytes;
+        continue;
+      }
+
+      const auto& array = g_gxState.arrays[i];
+      if (array.data == nullptr || array.stride == 0) {
+        return false;
+      }
+      const uint32_t groupCount = (attr == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3) ? 3u : 1u;
+      const uint32_t groupBytes = bytes / groupCount;
+      for (uint32_t group = 0; group < groupCount; ++group) {
+        const uint32_t index = type == GX_INDEX16 ? read_u16(src, bigEndian) : src[0];
+        src += type == GX_INDEX16 ? 2u : 1u;
+        const size_t byteOffset = static_cast<size_t>(index) * array.stride;
+        if (byteOffset + groupBytes > array.size) {
+          return false;
+        }
+        const auto* groupSrc = static_cast<const uint8_t*>(array.data) + byteOffset;
+        std::memcpy(dst, groupSrc, groupBytes);
+        dst += groupBytes;
+      }
+    }
+    srcVertex += inputStride;
+    dstVertex += outputStride;
+  }
+  return true;
+}
+#endif
 
 // The per-draw geometry signature, matrix-usage mask and draw-identity hashes exist purely to feed frame interpolation (build_uniform consumes them only after its `frame_interpolation_fps() == 0` early-out).
 static inline bool frame_interpolation_identity_needed() noexcept {
   return frame_interpolation_active() && g_gxState.projType == GX_PERSPECTIVE;
 }
 
-static uint32_t matrix_index_prefix_size(GXVtxFmt fmt) noexcept {
+static uint32_t matrix_index_prefix_size(GXVtxFmt fmt, bool hasDirectPnMtx) noexcept {
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
   uint32_t size = 0;
   for (int i = GX_VA_PNMTXIDX; i < GX_VA_POS; ++i) {
     const auto attr = static_cast<GXAttr>(i);
-    switch (g_gxState.vtxDesc[i]) {
+    const auto desc = (hasDirectPnMtx && i == GX_VA_PNMTXIDX) ? GX_DIRECT : g_gxState.vtxDesc[i];
+    switch (desc) {
     case GX_NONE:
       break;
     case GX_DIRECT:
@@ -1886,13 +1988,14 @@ static uint32_t matrix_index_prefix_size(GXVtxFmt fmt) noexcept {
 }
 
 static HashType draw_geometry_signature(GXVtxFmt fmt, const uint8_t* vertices,
-                                        uint16_t vtxCount, uint32_t vtxStride) noexcept {
+                                        uint16_t vtxCount, uint32_t vtxStride,
+                                        bool hasDirectPnMtx) noexcept {
   Hasher hasher;
   hasher.update(vtxCount);
   hasher.update(vtxStride);
 
   // Matrix-index bytes select an instance's current XF palette slots, so they are deliberately excluded from mesh identity.
-  const uint32_t matrixPrefix = std::min(matrix_index_prefix_size(fmt), vtxStride);
+  const uint32_t matrixPrefix = std::min(matrix_index_prefix_size(fmt, hasDirectPnMtx), vtxStride);
   if (matrixPrefix == 0) {
     // Most draws have no direct matrix-index prefix.
     hasher.update(vertices, static_cast<size_t>(vtxCount) * vtxStride);
@@ -1940,8 +2043,8 @@ static uint16_t pn_mtx_mask(const uint8_t* vertices, uint16_t vtxCount,
 }
 
 static PnMtxUsage pn_mtx_usage(const uint8_t* vertices, uint16_t vtxCount,
-                               uint32_t vtxStride) noexcept {
-  if (g_gxState.vtxDesc[GX_VA_PNMTXIDX] != GX_DIRECT) {
+                               uint32_t vtxStride, bool hasDirectPnMtx) noexcept {
+  if (!hasDirectPnMtx) {
     const uint32_t matrixIndex = std::min<uint32_t>(g_gxState.currentPnMtx, MaxPnMtx - 1);
     return {
         .mask = static_cast<uint16_t>(1u << matrixIndex),
@@ -2049,25 +2152,27 @@ static const CachedPipelineState& cached_pipeline_state(const PipelineConfig& co
 }
 
 // Resolving a pipeline the long way costs a ~2.7KB zero-init, a full populate_pipeline_config, an XXH3 over the whole config and a memcmp against the hash-indexed slot -- roughly 11KB of memory traffic for a result that is almost always identical to the previous draw's.
-static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtxFmt fmt) {
+static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtxFmt fmt,
+                                                         bool indexedAttrsExpanded = false) {
   struct Memo {
     const CachedPipelineState* state = nullptr;
     u32 generation = 0;
     u32 sampleCount = 0;
     GXPrimitive prim = static_cast<GXPrimitive>(0);
     GXVtxFmt fmt = static_cast<GXVtxFmt>(0);
+    bool indexedAttrsExpanded = false;
   };
   static Memo memo{};
 
   const u32 sampleCount = gfx::get_sample_count();
   const u32 generation = g_gxState.pipelineStateGeneration;
   if (memo.state != nullptr && memo.generation == generation && memo.sampleCount == sampleCount &&
-      memo.prim == prim && memo.fmt == fmt) LIKELY {
+      memo.prim == prim && memo.fmt == fmt && memo.indexedAttrsExpanded == indexedAttrsExpanded) LIKELY {
     return *memo.state;
   }
 
   PipelineConfig config{};
-  populate_pipeline_config(config, prim, fmt);
+  populate_pipeline_config(config, prim, fmt, indexedAttrsExpanded);
   // cached_pipeline_state hands back a reference into a fixed direct-mapped table, so the address stays valid; the entry it points at can only be rewritten by another call to that function, and every such call goes through this miss path and replaces the memo in the same breath.
   const CachedPipelineState& state = cached_pipeline_state(config);
   memo = Memo{
@@ -2076,6 +2181,7 @@ static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtx
       .sampleCount = sampleCount,
       .prim = prim,
       .fmt = fmt,
+      .indexedAttrsExpanded = indexedAttrsExpanded,
   };
   return state;
 }
@@ -2114,15 +2220,42 @@ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, ui
 
   // This entry point bypasses process(), so it owns the renderer lock itself.
   std::lock_guard gpuLock(aurora::renderer_gpu_mutex());
-  const gfx::Range vertRange = gfx::push_verts(vertices, vertexBytes);
+#if defined(__aarch64__) && defined(__linux__)
+  static std::vector<uint8_t> s_cpuExpandedRawVertices;
+  const bool indexedAttrsExpanded = draw_uses_indexed_attrs(fmt) &&
+                                    expand_indexed_vertices(fmt, vertices, vtxCount, true,
+                                                            s_cpuExpandedRawVertices);
+  if (indexedAttrsExpanded) {
+    log_indexed_fallback_use("submit_raw_draw", fmt, vtxCount,
+                             static_cast<uint32_t>(s_cpuExpandedRawVertices.size()));
+  }
+  const uint8_t* drawVertices = indexedAttrsExpanded ? s_cpuExpandedRawVertices.data() : vertices;
+  const uint32_t drawVertexStride = indexedAttrsExpanded
+                                        ? static_cast<uint32_t>(s_cpuExpandedRawVertices.size()) / vtxCount
+                                        : vtxSize;
+  const uint32_t drawVertexBytes = indexedAttrsExpanded
+                                       ? static_cast<uint32_t>(s_cpuExpandedRawVertices.size())
+                                       : vertexBytes;
+#else
+  const bool indexedAttrsExpanded = false;
+  const uint8_t* drawVertices = vertices;
+  const uint32_t drawVertexStride = vtxSize;
+  const uint32_t drawVertexBytes = vertexBytes;
+#endif
+  const gfx::Range vertRange = gfx::push_verts(drawVertices, drawVertexBytes);
   const bool interpolationIdentityActive = frame_interpolation_identity_needed();
+  const bool hasDirectPnMtx = indexedAttrsExpanded || g_gxState.vtxDesc[GX_VA_PNMTXIDX] == GX_DIRECT;
   const PnMtxUsage matrixUsage = interpolationIdentityActive
-                                     ? pn_mtx_usage(vertices, vtxCount, vtxSize)
+                                     ? pn_mtx_usage(drawVertices, vtxCount, drawVertexStride,
+                                                    hasDirectPnMtx)
                                      : PnMtxUsage{};
   handle_draw_unmerged(prim, fmt, vtxCount, vertRange,
                        matrixUsage.mask, matrixUsage.topologySignature,
-                       interpolationIdentityActive ? draw_geometry_signature(fmt, vertices, vtxCount, vtxSize) : 0,
-                       interpolationIdentityActive);
+                       interpolationIdentityActive
+                           ? draw_geometry_signature(fmt, drawVertices, vtxCount, drawVertexStride,
+                                                     hasDirectPnMtx)
+                           : 0,
+                       interpolationIdentityActive, indexedAttrsExpanded);
   return true;
 }
 
@@ -2153,11 +2286,33 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
 
   // Push raw vertex data to buffer
   const uint8_t* vertices = data + pos;
-  gfx::Range vertRange = gfx::push_verts(vertices, totalVtxBytes);
+#if defined(__aarch64__) && defined(__linux__)
+  static std::vector<uint8_t> s_cpuExpandedVertices;
+  const bool indexedAttrsExpanded = draw_uses_indexed_attrs(fmt) &&
+                                    expand_indexed_vertices(fmt, vertices, vtxCount, bigEndian,
+                                                            s_cpuExpandedVertices);
+  if (indexedAttrsExpanded) {
+    log_indexed_fallback_use("handle_draw", fmt, vtxCount,
+                             static_cast<uint32_t>(s_cpuExpandedVertices.size()));
+  }
+  const uint8_t* drawVertices = indexedAttrsExpanded ? s_cpuExpandedVertices.data() : vertices;
+  const uint32_t drawVertexStride = indexedAttrsExpanded
+                                        ? static_cast<uint32_t>(s_cpuExpandedVertices.size()) / vtxCount
+                                        : vtxSize;
+  const uint32_t drawVertexBytes = indexedAttrsExpanded
+                                       ? static_cast<uint32_t>(s_cpuExpandedVertices.size())
+                                       : totalVtxBytes;
+#else
+  const bool indexedAttrsExpanded = false;
+  const uint8_t* drawVertices = vertices;
+  const uint32_t drawVertexStride = vtxSize;
+  const uint32_t drawVertexBytes = totalVtxBytes;
+#endif
+  gfx::Range vertRange = gfx::push_verts(drawVertices, drawVertexBytes);
   pos += totalVtxBytes;
 
   // Try to merge with previous draw call
-  if (!g_gxState.stateDirty) LIKELY {
+  if (!indexedAttrsExpanded && !g_gxState.stateDirty) LIKELY {
     auto* lastDraw = gfx::get_last_draw_command<DrawData>();
     // Only if the previous draw call was a single instance draw (no lines/points handling)
     if (lastDraw != nullptr && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
@@ -2179,27 +2334,33 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
       ++gfx::g_mergedDrawCallCount;
       // This primitive now renders through the draw we merged into, so its palette slots belong to that draw's interpolation snapshot as well.
       if (s_lastDrawRecordedInterpolation) UNLIKELY {
-        extend_interpolation_draw(pn_mtx_mask(vertices, vtxCount, vtxSize));
+        extend_interpolation_draw(pn_mtx_mask(drawVertices, vtxCount, drawVertexStride));
       }
       return true;
     }
   }
 
   const bool interpolationIdentityActive = frame_interpolation_identity_needed();
+  const bool hasDirectPnMtx = indexedAttrsExpanded || g_gxState.vtxDesc[GX_VA_PNMTXIDX] == GX_DIRECT;
   const PnMtxUsage matrixUsage = interpolationIdentityActive
-                                     ? pn_mtx_usage(vertices, vtxCount, vtxSize)
+                                     ? pn_mtx_usage(drawVertices, vtxCount, drawVertexStride,
+                                                    hasDirectPnMtx)
                                      : PnMtxUsage{};
   handle_draw_unmerged(prim, fmt, vtxCount, vertRange,
                        matrixUsage.mask, matrixUsage.topologySignature,
-                       interpolationIdentityActive ? draw_geometry_signature(fmt, vertices, vtxCount, vtxSize) : 0,
-                       interpolationIdentityActive);
+                       interpolationIdentityActive
+                           ? draw_geometry_signature(fmt, drawVertices, vtxCount, drawVertexStride,
+                                                     hasDirectPnMtx)
+                           : 0,
+                       interpolationIdentityActive, indexedAttrsExpanded);
   return true;
 }
 
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                  gfx::Range vertRange, uint16_t usedPnMtxMask,
                                  HashType matrixTopologySignature,
-                                 HashType geometrySignature, bool interpolationIdentityActive) {
+                                 HashType geometrySignature, bool interpolationIdentityActive,
+                                 bool indexedAttrsExpanded) {
   ZoneScoped;
   // GX_CULL_ALL rasterizes nothing on hardware - no color, no depth.
   if (g_gxState.cullMode == GX_CULL_ALL && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS)
@@ -2215,21 +2376,26 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
 
   // Build pipeline, bind groups, and push draw command
   BindGroupRanges ranges{};
-  for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
-    if (g_gxState.vtxDesc[i] != GX_INDEX8 && g_gxState.vtxDesc[i] != GX_INDEX16) {
-      continue;
-    }
-    auto& array = g_gxState.arrays[i];
-    if (array.cachedRange.size > 0) {
-      ranges.vaRanges[i - GX_VA_POS] = array.cachedRange;
-    } else {
-      const auto range = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
-      ranges.vaRanges[i - GX_VA_POS] = range;
-      array.cachedRange = range;
+  if (!indexedAttrsExpanded) {
+    for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
+      if (g_gxState.vtxDesc[i] != GX_INDEX8 && g_gxState.vtxDesc[i] != GX_INDEX16) {
+        continue;
+      }
+      auto& array = g_gxState.arrays[i];
+      const u64 generation = guest_write_generation(array.data, array.size);
+      if (array.cachedRange.size > 0 &&
+          guest_write_generation_matches(array.sourceGeneration, generation)) {
+        ranges.vaRanges[i - GX_VA_POS] = array.cachedRange;
+      } else {
+        const auto range = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
+        ranges.vaRanges[i - GX_VA_POS] = range;
+        array.cachedRange = range;
+        array.sourceGeneration = generation;
+      }
     }
   }
 
-  const auto& pipelineState = resolve_pipeline_state(prim, fmt);
+  const auto& pipelineState = resolve_pipeline_state(prim, fmt, indexedAttrsExpanded);
   const auto& info = pipelineState.shaderInfo;
 
   resolve_sampled_textures(info);
@@ -2356,6 +2522,7 @@ bool handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
       array.le = le;
       // Only drop the cached upload when the backing array actually changes.
       array.cachedRange = {};
+      array.sourceGeneration = kGuestWriteUntracked;
       mark_pipeline_state_dirty();
     }
   } else if (subCmd == GX_LOAD_AURORA_TEXOBJ) {

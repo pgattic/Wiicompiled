@@ -124,15 +124,11 @@ inline double PpcLoadPairPsqFloatFromHostInline(const uint8_t* host)
     return PpcM128ToPsInline(_mm_castsi128_ps(
         PpcLoadPairPsqFloatBitsLanesInline(PpcPsqSwapPairBytesInline(raw))));
 #elif defined(__aarch64__)
-    // The x86 path's full 8-byte pshufb reversal plus a same-endian load is,
-    // taken together, exactly a 64-bit byteswap of a plain little-endian load:
-    // it turns the on-disk [ps0 big-endian][ps1 big-endian] byte layout into a
-    // native uint64 with low 32 bits = ps1, high 32 bits = ps0 (this file's
-    // documented packed-double lane convention).
-    uint64_t raw = 0;
-    std::memcpy(&raw, host, sizeof(raw));
-    const uint64_t swapped = __builtin_bswap64(raw);
-    return PpcBitCastToDoubleInline(PpcLoadPairPsqFloatBitsPackedInline(swapped));
+    const uint32_t ps0Bits = PpcLoadPsqFloatBitsInline(BigEndian::Read32(host));
+    const uint32_t ps1Bits = PpcLoadPsqFloatBitsInline(BigEndian::Read32(host + sizeof(uint32_t)));
+    return PpcMakePairedResultInline(
+        PpcBitCastToFloatInline(ps0Bits),
+        PpcBitCastToFloatInline(ps1Bits)).d;
 #endif
 }
 
@@ -144,11 +140,10 @@ inline void PpcStorePairPsqFloatToHostInline(uint8_t* host, double value)
         _mm_castps_si128(PpcPsToM128Inline(value)));
     _mm_storel_epi64(reinterpret_cast<__m128i*>(host), PpcPsqSwapPairBytesInline(lanes));
 #elif defined(__aarch64__)
-    // Inverse of the load path above: bswap64 is its own inverse, so applying
-    // it to the quieted packed value reproduces the on-disk big-endian bytes.
-    const uint64_t quieted = PpcStorePairPsqFloatBitsPackedInline(PpcBitCastToU64Inline(value));
-    const uint64_t swapped = __builtin_bswap64(quieted);
-    std::memcpy(host, &swapped, sizeof(swapped));
+    PPC_FPR fpr{};
+    fpr.d = value;
+    BigEndian::Write32(host, PpcStorePsqFloatBitsInline(PpcBitCastToU32Inline(fpr.paired.ps0)));
+    BigEndian::Write32(host + sizeof(uint32_t), PpcStorePsqFloatBitsInline(PpcBitCastToU32Inline(fpr.paired.ps1)));
 #endif
 }
 

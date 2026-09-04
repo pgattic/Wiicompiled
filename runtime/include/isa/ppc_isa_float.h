@@ -94,7 +94,10 @@ inline PpcPairVec PpcPsToM128Inline(double value)
 #if defined(__x86_64__)
     return _mm_castpd_ps(_mm_set_sd(value));
 #elif defined(__aarch64__)
-    return vreinterpret_f32_f64(vdup_n_f64(value));
+    const uint64_t bits = PpcBitCastToU64Inline(value);
+    uint32x2_t lanes = vdup_n_u32(static_cast<uint32_t>(bits));
+    lanes = vset_lane_u32(static_cast<uint32_t>(bits >> 32), lanes, 1);
+    return vreinterpret_f32_u32(lanes);
 #endif
 }
 
@@ -103,7 +106,11 @@ inline double PpcM128ToPsInline(PpcPairVec value)
 #if defined(__x86_64__)
     return _mm_cvtsd_f64(_mm_castps_pd(value));
 #elif defined(__aarch64__)
-    return vget_lane_f64(vreinterpret_f64_f32(value), 0);
+    const uint32x2_t lanes = vreinterpret_u32_f32(value);
+    const uint64_t bits =
+        static_cast<uint64_t>(vget_lane_u32(lanes, 0)) |
+        (static_cast<uint64_t>(vget_lane_u32(lanes, 1)) << 32);
+    return PpcBitCastToDoubleInline(bits);
 #endif
 }
 
@@ -569,6 +576,27 @@ inline PpcPairVec PpcResolveNanLanes3Inline(
     const uint32x2_t resultNan = vmvn_u32(vceq_f32(result, result));
     return vbsl_f32(resultNan, replacement, result);
 }
+
+template <typename Fn>
+inline PpcPairVec PpcScalarPairBinaryInline(PpcPairVec lhs, PpcPairVec rhs, Fn&& fn)
+{
+    const double lhsPacked = PpcM128ToPsInline(lhs);
+    const double rhsPacked = PpcM128ToPsInline(rhs);
+    return PpcPsToM128Inline(PpcPackPairedInline(
+        fn(PpcGetPs0Inline(lhsPacked), PpcGetPs0Inline(rhsPacked)),
+        fn(PpcGetPs1Inline(lhsPacked), PpcGetPs1Inline(rhsPacked))));
+}
+
+template <typename Fn>
+inline PpcPairVec PpcScalarPairTernaryInline(PpcPairVec a, PpcPairVec b, PpcPairVec c, Fn&& fn)
+{
+    const double aPacked = PpcM128ToPsInline(a);
+    const double bPacked = PpcM128ToPsInline(b);
+    const double cPacked = PpcM128ToPsInline(c);
+    return PpcPsToM128Inline(PpcPackPairedInline(
+        fn(PpcGetPs0Inline(aPacked), PpcGetPs0Inline(bPacked), PpcGetPs0Inline(cPacked)),
+        fn(PpcGetPs1Inline(aPacked), PpcGetPs1Inline(bPacked), PpcGetPs1Inline(cPacked))));
+}
 #endif // defined(__aarch64__)
 
 inline PpcPairVec PpcMulPairInline(PpcPairVec lhs, PpcPairVec rhs)
@@ -576,10 +604,7 @@ inline PpcPairVec PpcMulPairInline(PpcPairVec lhs, PpcPairVec rhs)
 #if defined(__x86_64__)
     return _mm_mul_ps(lhs, rhs);
 #elif defined(__aarch64__)
-    const PpcPairVec result = vmul_f32(lhs, rhs);
-    if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
-        return PpcResolveNanLanesInline(result, lhs, rhs);
-    return result;
+    return PpcScalarPairBinaryInline(lhs, rhs, [](float a, float b) { return a * b; });
 #endif
 }
 
@@ -609,10 +634,9 @@ inline PpcPairVec PpcFmaddPairInline(PpcPairVec multiplicand, PpcPairVec multipl
 #if defined(__x86_64__)
     return _mm_fmadd_ps(multiplicand, multiplier, addend);
 #elif defined(__aarch64__)
-    const PpcPairVec result = vfma_f32(addend, multiplicand, multiplier);
-    if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
-        return PpcResolveNanLanes3Inline(result, multiplicand, multiplier, addend);
-    return result;
+    return PpcScalarPairTernaryInline(
+        multiplicand, multiplier, addend,
+        [](float a, float b, float c) { return PpcAccuratePsMaddLaneNoNiInline<false>(a, b, c); });
 #endif
 }
 
@@ -621,10 +645,9 @@ inline PpcPairVec PpcFmsubPairInline(PpcPairVec multiplicand, PpcPairVec multipl
 #if defined(__x86_64__)
     return _mm_fmsub_ps(multiplicand, multiplier, subtractor);
 #elif defined(__aarch64__)
-    const PpcPairVec result = vfma_f32(vneg_f32(subtractor), multiplicand, multiplier);
-    if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
-        return PpcResolveNanLanes3Inline(result, multiplicand, multiplier, subtractor);
-    return result;
+    return PpcScalarPairTernaryInline(
+        multiplicand, multiplier, subtractor,
+        [](float a, float b, float c) { return PpcAccuratePsMaddLaneNoNiInline<true>(a, b, c); });
 #endif
 }
 
@@ -772,10 +795,7 @@ inline PpcPairVec PpcAddPairInline(PpcPairVec lhs, PpcPairVec rhs)
 #if defined(__x86_64__)
     return _mm_add_ps(lhs, rhs);
 #elif defined(__aarch64__)
-    const PpcPairVec result = vadd_f32(lhs, rhs);
-    if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
-        return PpcResolveNanLanesInline(result, lhs, rhs);
-    return result;
+    return PpcScalarPairBinaryInline(lhs, rhs, [](float a, float b) { return a + b; });
 #endif
 }
 
@@ -784,10 +804,7 @@ inline PpcPairVec PpcSubPairInline(PpcPairVec lhs, PpcPairVec rhs)
 #if defined(__x86_64__)
     return _mm_sub_ps(lhs, rhs);
 #elif defined(__aarch64__)
-    const PpcPairVec result = vsub_f32(lhs, rhs);
-    if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
-        return PpcResolveNanLanesInline(result, lhs, rhs);
-    return result;
+    return PpcScalarPairBinaryInline(lhs, rhs, [](float a, float b) { return a - b; });
 #endif
 }
 
@@ -796,10 +813,7 @@ inline PpcPairVec PpcDivPairInline(PpcPairVec lhs, PpcPairVec rhs)
 #if defined(__x86_64__)
     return _mm_div_ps(lhs, rhs);
 #elif defined(__aarch64__)
-    const PpcPairVec result = vdiv_f32(lhs, rhs);
-    if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
-        return PpcResolveNanLanesInline(result, lhs, rhs);
-    return result;
+    return PpcScalarPairBinaryInline(lhs, rhs, [](float a, float b) { return a / b; });
 #endif
 }
 

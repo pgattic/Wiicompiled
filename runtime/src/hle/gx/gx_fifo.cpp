@@ -15,6 +15,17 @@ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, ui
                      uint32_t vertexBytes);
 }
 
+namespace {
+void SubmitFifoCpRegPacketToNative(uint8_t reg, uint32_t value) {
+    uint8_t packet[6];
+    packet[0] = GX_LOAD_CP_REG_CMD;
+    packet[1] = reg;
+    BigEndian::Write32(packet + 2, value);
+    GXCallDisplayList(packet, sizeof(packet));
+    GXMarkFrameWork();
+}
+}
+
 void HleGxState::ResetVertex() {
     currentAttr = NextEnabledAttr(GX_VA_PNMTXIDX - 1);
     currentComp = 0;
@@ -449,6 +460,9 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
             const uint8_t reg = data[1];
             const uint32_t cpValue = ReadBE32(data + 2);
             GxCpDecode::ApplyCpRegWrite(reg, cpValue);
+            if (reg == 0x30 || reg == 0x40) {
+                SubmitFifoCpRegPacketToNative(reg, cpValue);
+            }
             if (!consumeBytes(6, sink)) break;
             continue;
         }

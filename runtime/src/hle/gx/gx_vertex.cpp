@@ -52,8 +52,11 @@ extern "C" void GX__SetVtxDesc_8016d3a4(uint32_t a, uint32_t t) {
         g_hleGxState.vtxDesc[GX_VA_NBT] = GX_NONE;
     }
     if (g_hleGxState.vtxDesc[attr] != oldType) g_hleGxState.InvalidateVtxLayoutHash();
-    if(IsMatrixIndexAttr((GXAttr)attr)) return;
-    GXSetVtxDesc((GXAttr)a, (t==GX_INDEX8||t==GX_INDEX16)?GX_DIRECT:(GXAttrType)t);
+    const GXAttrType nativeType =
+        IsMatrixIndexAttr(static_cast<GXAttr>(attr))
+            ? (t == GX_NONE ? GX_NONE : GX_DIRECT)
+            : ((t == GX_INDEX8 || t == GX_INDEX16) ? GX_DIRECT : static_cast<GXAttrType>(t));
+    GXSetVtxDesc(static_cast<GXAttr>(a), nativeType);
 }
 PPC_NATIVE_OVERRIDE_VOID(8016d3a4, GX__SetVtxDesc_8016d3a4, (uint32_t a, uint32_t t), (a, t));
 

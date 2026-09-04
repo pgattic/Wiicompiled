@@ -284,6 +284,7 @@ struct AttrArray {
   u8 stride;
   bool le = true;
   gfx::Range cachedRange;
+  u64 sourceGeneration = kGuestWriteUntracked;
 };
 inline bool operator==(const AttrArray& lhs, const AttrArray& rhs) {
   return lhs.data == rhs.data && lhs.size == rhs.size && lhs.stride == rhs.stride && lhs.le == rhs.le;
@@ -755,7 +756,8 @@ struct ShaderInfo {
 struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
 };
-void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept;
+void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt,
+                              bool directIndexedFallback = false) noexcept;
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
                                     wgpu::ShaderModule shader, const char* label) noexcept;
 wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept;

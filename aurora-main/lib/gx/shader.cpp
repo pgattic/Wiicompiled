@@ -725,6 +725,40 @@ auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -
     buf = "abuf"sv;
     le = mapping.le;
   }
+#if defined(__aarch64__) && defined(__linux__)
+  if (attr == GX_VA_POS && (mapping.attrType == GX_INDEX8 || mapping.attrType == GX_INDEX16)) {
+    const auto scalar_pos_load = [&](u32 component) {
+      const auto componentOffs = offset_plus(offs, component * attr_comp_type_size(mapping.compType));
+      switch (mapping.compType) {
+      case GX_U8:
+        return fmt::format("f32(raw_fetch_u8_1(&{}, {})) / f32(1u << {})", buf, componentOffs, mapping.frac);
+      case GX_S8:
+        return fmt::format(
+            "f32(select(i32(raw_fetch_u8_1(&{}, {})), i32(raw_fetch_u8_1(&{}, {})) - 256, "
+            "raw_fetch_u8_1(&{}, {}) >= 128u)) / f32(1u << {})",
+            buf, componentOffs, buf, componentOffs, buf, componentOffs, mapping.frac);
+      case GX_U16:
+        return fmt::format("f32(raw_fetch_u16_1(&{}, {}, {})) / f32(1u << {})", buf, componentOffs, le,
+                           mapping.frac);
+      case GX_S16:
+        return fmt::format(
+            "f32(select(i32(raw_fetch_u16_1(&{}, {}, {})), i32(raw_fetch_u16_1(&{}, {}, {})) - 65536, "
+            "raw_fetch_u16_1(&{}, {}, {}) >= 32768u)) / f32(1u << {})",
+            buf, componentOffs, le, buf, componentOffs, le, buf, componentOffs, le, mapping.frac);
+      case GX_F32:
+        return fmt::format("load_f32(&{}, {}, {})", buf, componentOffs, le);
+      default:
+        return std::string{};
+      }
+    };
+    const auto x = scalar_pos_load(0);
+    const auto y = scalar_pos_load(1);
+    const auto z = mapping.cnt == 2 ? "0.0"s : scalar_pos_load(2);
+    if (!x.empty() && !y.empty() && !z.empty()) {
+      return fmt::format("vec3f({}, {}, {})", x, y, z);
+    }
+  }
+#endif
   switch (attr) {
   case GX_VA_PNMTXIDX:
     return fmt::format("(raw_fetch_u8_1(&{}, {}) / 3u)", buf, offs);
@@ -905,6 +939,20 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
   std::string vtxXfrAttrsPre;
   std::string vtxXfrAttrs;
   size_t vtxOutIdx = 0;
+  const auto postex_mul = [](std::string_view vecExpr, std::string_view idxExpr) {
+    return fmt::format(
+        "vec3f(dot({0}, ubuf.postex_mtx[({1}) * 3u + 0u]), "
+        "dot({0}, ubuf.postex_mtx[({1}) * 3u + 1u]), "
+        "dot({0}, ubuf.postex_mtx[({1}) * 3u + 2u]))",
+        vecExpr, idxExpr);
+  };
+  const auto nrm_mul = [](std::string_view vecExpr, std::string_view idxExpr) {
+    return fmt::format(
+        "vec3f(dot({0}, ubuf.nrm_mtx[({1}) * 3u + 0u]), "
+        "dot({0}, ubuf.nrm_mtx[({1}) * 3u + 1u]), "
+        "dot({0}, ubuf.nrm_mtx[({1}) * 3u + 2u]))",
+        vecExpr, idxExpr);
+  };
 
   // Load points for line/point expansion
   std::string_view vidxAttr = "vidx"sv;
@@ -921,8 +969,9 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
           "\n    let in_vidx = iidx;"
           "\n    let in_pos = {};"
           "\n    let in_pnmtxidx = {};"
-          "\n    let mv_pos = vec4f(in_pos, 1.0) * ubuf.postex_mtx[in_pnmtxidx];",
-          attr_load(config, GX_VA_POS, "in_vidx"sv), attr_load(config, GX_VA_PNMTXIDX, "in_vidx"sv));
+          "\n    let mv_pos = {};",
+          attr_load(config, GX_VA_POS, "in_vidx"sv), attr_load(config, GX_VA_PNMTXIDX, "in_vidx"sv),
+          postex_mul("vec4f(in_pos, 1.0)", "in_pnmtxidx"));
     } else {
       // GX_LINES / GX_LINESTRIP: each instance = two vertices, expand to quad
       vtxXfrAttrsPre += fmt::format(
@@ -936,12 +985,13 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
           "\n    let pnmtxidx_a = {};"
           "\n    let pnmtxidx_b = {};"
           "\n    let in_pnmtxidx = select(pnmtxidx_a, pnmtxidx_b, use_b);"
-          "\n    let mv_pos_a = vec4f(pos_a, 1.0) * ubuf.postex_mtx[pnmtxidx_a];"
-          "\n    let mv_pos_b = vec4f(pos_b, 1.0) * ubuf.postex_mtx[pnmtxidx_b];"
+          "\n    let mv_pos_a = {};"
+          "\n    let mv_pos_b = {};"
           "\n    let mv_pos = select(mv_pos_a, mv_pos_b, use_b);",
           config.lineMode == 1 ? 2 : 1, attr_load(config, GX_VA_POS, "vidx_a"sv),
           attr_load(config, GX_VA_POS, "vidx_b"sv), attr_load(config, GX_VA_PNMTXIDX, "vidx_a"sv),
-          attr_load(config, GX_VA_PNMTXIDX, "vidx_b"sv));
+          attr_load(config, GX_VA_PNMTXIDX, "vidx_b"sv), postex_mul("vec4f(pos_a, 1.0)", "pnmtxidx_a"),
+          postex_mul("vec4f(pos_b, 1.0)", "pnmtxidx_b"));
     }
     vidxAttr = "in_vidx"sv;
   } else if (config.attrs[GX_VA_PNMTXIDX].attrType == GX_NONE) {
@@ -962,9 +1012,9 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
 
   if (config.lineMode == 0) {
     vtxXfrAttrsPre += fmt::format(
-        "\n    let mv_pos = vec4f({}, 1.0) * ubuf.postex_mtx[in_pnmtxidx];"
+        "\n    let mv_pos = {};"
         "\n    out.pos = vec4f(mv_pos, 1.0) * ubuf.proj;",
-        vtx_attr(config, GX_VA_POS));
+        postex_mul(fmt::format("vec4f({}, 1.0)", vtx_attr(config, GX_VA_POS)), "in_pnmtxidx"));
   } else if (config.lineMode == 3) {
     // GX_POINTS: expand single vertex to axis-aligned screen-space square
     vtxXfrAttrsPre +=
@@ -1004,14 +1054,14 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
       "vec2f(-1.0, 1.0) / (6.0 * max(abs(ubuf.render_viewport_size), vec2f(1.0)));"
       "\n    out.pos = vec4f(out.pos.xy + out.pos.w * gx_pixel_center_correction, out.pos.zw);";
   vtxXfrAttrsPre += fmt::format(
-      "\n    let nrm_tmp = vec4f({}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+      "\n    let nrm_tmp = {};"
       "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
-      vtx_attr(config, GX_VA_NRM));
+      nrm_mul(fmt::format("vec4f({}, 0.0)", vtx_attr(config, GX_VA_NRM)), "in_pnmtxidx"));
 
   uniBufAttrs += "\n    proj: mat4x4f,";
   // Only the matrix slots this shader can read are uploaded, in compacted order; see UniformMatrixLayout.
-  uniBufAttrs += fmt::format("\n    postex_mtx: array<mat3x4f, {}>,", info.matrixLayout.postexCount);
-  uniBufAttrs += fmt::format("\n    nrm_mtx: array<mat3x4f, {}>,", info.matrixLayout.nrmCount);
+  uniBufAttrs += fmt::format("\n    postex_mtx: array<vec4f, {}>,", info.matrixLayout.postexCount * 3);
+  uniBufAttrs += fmt::format("\n    nrm_mtx: array<vec4f, {}>,", info.matrixLayout.nrmCount * 3);
   std::string fragmentFnPre;
   std::string fragmentFn;
   const int zTexStage = tev_z_texture_stage(config);
@@ -1193,7 +1243,8 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     }
     if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
       if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
-        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[in_texmtxidx{0} / 3u];", i);
+        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = {1};", i,
+                                   postex_mul(fmt::format("tc{}", i), fmt::format("in_texmtxidx{} / 3u", i)));
       } else if (tcg.mtx == GX_IDENTITY) {
         vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0}.xyz;", i);
       } else {
@@ -1202,7 +1253,8 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
                                                         : texMtxSlot;
         CHECK(texMtxIdx != UniformMatrixLayout::kAbsent,
               "texgen {} matrix slot {} missing from the uniform layout", i, texMtxSlot);
-        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[{1}];", i, texMtxIdx);
+        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = {1};", i,
+                                   postex_mul(fmt::format("tc{}", i), fmt::format("{}u", texMtxIdx)));
       }
       if (tcg.type == GX_TG_MTX2x4) {
         vtxXfrAttrs += fmt::format("\n    tc{0}_tmp.z = 1.0f;", i);

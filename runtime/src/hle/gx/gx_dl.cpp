@@ -60,6 +60,10 @@ static void ApplyAuroraVtxDesc();
 static void ApplyAuroraVtxAttrFmtForDisplayList(GXVtxFmt fmt, bool mixed);
 static void SyncAppliedVtxStateFromHleReal();
 static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes);
+static void SubmitDlCpRegPacketToNative(uint8_t reg, uint32_t value);
+#if defined(__aarch64__) && defined(__linux__)
+static bool SubmitIndexedXfPacketCpu(uint8_t cmd, uint32_t value);
+#endif
 
 static inline uint8_t ScaleLytAlpha(uint8_t alpha, uint32_t modulate) {
     const int32_t product = static_cast<int32_t>(alpha) * static_cast<int32_t>(modulate & 0xFFu);
@@ -821,7 +825,13 @@ struct DlInterpretVisitor {
     bool OnNop(uint8_t) { return true; }
     bool OnInvalidateVertexCache(uint8_t) { return true; }
     bool OnUnknownCommand(uint8_t) { return true; }
-    bool OnCpReg(const uint8_t*, uint8_t reg, uint32_t value) { ApplyCpRegWrite(reg, value); return true; }
+    bool OnCpReg(const uint8_t*, uint8_t reg, uint32_t value) {
+        ApplyCpRegWrite(reg, value);
+        if (reg == 0x30 || reg == 0x40) {
+            SubmitDlCpRegPacketToNative(reg, value);
+        }
+        return true;
+    }
     bool OnBpReg(const uint8_t*, uint32_t bpWord) {
         GXApplyBPReg(static_cast<uint8_t>(bpWord >> 24), bpWord & 0x00FFFFFFu);
         return true;
@@ -832,6 +842,11 @@ struct DlInterpretVisitor {
         return true;
     }
     bool OnIndexedXf(const uint8_t* cmdPtr, uint8_t cmd, uint32_t value) {
+#if defined(__aarch64__) && defined(__linux__)
+        if (SubmitIndexedXfPacketCpu(cmd, value)) {
+            return true;
+        }
+#endif
         ApplyIndexedXfArrayForPacket(cmd, value);
         GXCallDisplayList(cmdPtr, 5);
         GXMarkFrameWork();
@@ -1037,6 +1052,55 @@ static std::vector<uint8_t>& FlattenDisplayListScratch() {
     static thread_local std::vector<uint8_t> s_scratch;
     return s_scratch;
 }
+
+static void SubmitDlCpRegPacketToNative(uint8_t reg, uint32_t value) {
+    uint8_t packet[6];
+    packet[0] = GX_LOAD_CP_REG_CMD;
+    packet[1] = reg;
+    BigEndian::Write32(packet + 2, value);
+    GXCallDisplayList(packet, sizeof(packet));
+    GXMarkFrameWork();
+}
+
+#if defined(__aarch64__) && defined(__linux__)
+static bool SubmitIndexedXfPacketCpu(uint8_t cmd, uint32_t value) {
+    const int attr = GX_POS_MTX_ARRAY +
+                     (((cmd & GxCmd::GX_OPCODE_MASK_CMD) - GxCmd::GX_LOAD_INDX_A_CMD) / 0x08);
+    if (attr < GX_POS_MTX_ARRAY || attr > GX_LIGHT_ARRAY) {
+        return false;
+    }
+
+    const uint32_t index = value >> 16;
+    const uint16_t count = static_cast<uint16_t>(((value >> 12) & 0x0fu) + 1u);
+    const uint16_t dstAddr = static_cast<uint16_t>(value & 0x0fffu);
+    const auto& arr = g_hleGxState.vtxArray[attr];
+    if (arr.base == 0 || arr.stride == 0) {
+        return false;
+    }
+
+    const uint32_t byteCount = static_cast<uint32_t>(count) * 4u;
+    const uint32_t span = index * arr.stride + byteCount;
+    if (!Memory::Contains(arr.base, span)) {
+        return false;
+    }
+
+    const uint8_t* hostPtr = static_cast<const uint8_t*>(GuestToHostPtr(arr.base, span));
+    if (!hostPtr) {
+        return false;
+    }
+
+    std::vector<uint8_t> packet;
+    packet.resize(1u + 4u + byteCount);
+    uint32_t pos = 0;
+    packet[pos++] = GX_LOAD_XF_REG_CMD;
+    BigEndian::Append16(packet.data(), pos, static_cast<uint16_t>(count - 1u));
+    BigEndian::Append16(packet.data(), pos, dstAddr);
+    std::memcpy(packet.data() + pos, hostPtr + index * arr.stride, byteCount);
+    GXCallDisplayList(packet.data(), static_cast<uint32_t>(packet.size()));
+    GXMarkFrameWork();
+    return true;
+}
+#endif
 
 static bool s_appliedVtxDescValid = false;
 static std::array<GXAttrType, 26> s_appliedVtxDesc{};
@@ -1283,6 +1347,40 @@ static bool ApplyAuroraIndexedXFArraysForDisplayList(const std::array<uint32_t, 
     return ok;
 }
 
+#if defined(__aarch64__) && defined(__linux__)
+static bool DisplayListUsesIndexedAttrs(const std::array<bool, GX_VA_MAX_ATTR>& sawIdx) {
+    for (int attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7; ++attr) {
+        if (sawIdx[attr]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool DisplayListUsesIndexedXfArrays(const std::array<bool, GX_VA_MAX_ATTR>& sawXfIdx) {
+    for (int attr = GX_POS_MTX_ARRAY; attr <= GX_LIGHT_ARRAY; ++attr) {
+        if (sawXfIdx[attr]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void LogDisplayListFastPathBypass(uint32_t listAddr, uint32_t nbytes,
+                                         bool indexedAttrs, bool indexedXf) {
+    static uint32_t logCount = 0;
+    if (logCount < 16) {
+        RT_LOGF(RT_TAG_GX,
+                "aarch64 display-list fast-path bypass addr=0x%08X bytes=%u indexedAttrs=%u indexedXf=%u\n",
+                listAddr, nbytes, indexedAttrs ? 1u : 0u, indexedXf ? 1u : 0u);
+        ++logCount;
+        if (logCount == 16) {
+            RT_LOGF(RT_TAG_GX, "suppressing further aarch64 display-list fast-path bypass logs\n");
+        }
+    }
+}
+#endif
+
 } // namespace
 
 extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size) {
@@ -1360,6 +1458,9 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
             }
             for (const auto& write : cached->cpWrites) {
                 ApplyCpRegWrite(write.reg, write.value);
+                if (write.reg == 0x30 || write.reg == 0x40) {
+                    SubmitDlCpRegPacketToNative(write.reg, write.value);
+                }
             }
             if (needsFlatten && flattenOk) {
                 if (entry.flattenVerbatim) {
@@ -1440,6 +1541,14 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                 const bool flattenXfOk =
                     ApplyAuroraIndexedXFArraysForDisplayList(maxXfIdx, maxXfBytes, sawXfIdx);
                 flattenApplyOk = flattenArraysOk && flattenXfOk;
+#if defined(__aarch64__) && defined(__linux__)
+                const bool indexedAttrs = DisplayListUsesIndexedAttrs(sawIdx);
+                const bool indexedXf = DisplayListUsesIndexedXfArrays(sawXfIdx);
+                if (flattenApplyOk && (indexedAttrs || indexedXf)) {
+                    LogDisplayListFastPathBypass(listAddr, nbytes, indexedAttrs, indexedXf);
+                    flattenApplyOk = false;
+                }
+#endif
             }
             if (flattenApplyOk) {
                 EnsureAuroraFrameActive();
@@ -1460,6 +1569,14 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                 arraysOk = ApplyAuroraArraysForDisplayList(maxIdx, sawIdx, dlVtxFmt, dlVtxFmtMixed);
                 xfOk = ApplyAuroraIndexedXFArraysForDisplayList(maxXfIdx, maxXfBytes, sawXfIdx);
                 applyOk = arraysOk && xfOk;
+#if defined(__aarch64__) && defined(__linux__)
+                const bool indexedAttrs = DisplayListUsesIndexedAttrs(sawIdx);
+                const bool indexedXf = DisplayListUsesIndexedXfArrays(sawXfIdx);
+                if (applyOk && (indexedAttrs || indexedXf)) {
+                    LogDisplayListFastPathBypass(listAddr, nbytes, indexedAttrs, indexedXf);
+                    applyOk = false;
+                }
+#endif
             }
             if (applyOk) {
                 EnsureAuroraFrameActive();
